@@ -13,10 +13,10 @@ import pandas as pd
 import streamlit as st
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, classification_report, make_scorer
 from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.model_selection import StratifiedKFold, train_test_split, cross_val_score
+from sklearn.model_selection import KFold, StratifiedKFold, train_test_split, cross_val_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
@@ -489,12 +489,14 @@ class TimeSeriesPredictor:
         X_seq, X_flat, y_num_raw, y_color_raw, y_bs_raw = self._build_matrices(df)
 
         y_combo = np.array([f"{a}|{b}|{c}" for a, b, c in zip(y_num_raw, y_color_raw, y_bs_raw)])
+        combo_counts = Counter(y_combo.tolist())
+        stratify_combo = y_combo if combo_counts and min(combo_counts.values()) >= 2 else None
         X_train_idx, X_test_idx = train_test_split(
             np.arange(len(X_flat)),
             test_size=0.2,
             random_state=42,
             shuffle=True,
-            stratify=y_combo if len(np.unique(y_combo)) > 1 else None,
+            stratify=stratify_combo if len(np.unique(y_combo)) > 1 else None,
         )
 
         X_seq_train, X_seq_test = X_seq[X_train_idx], X_seq[X_test_idx]
@@ -608,9 +610,7 @@ class TimeSeriesPredictor:
                     test_accs["lstm"] = float("nan")
 
             cv_model = models["xgb"]
-            cv_splits = min(5, max(3, int(np.min(np.bincount(y_tr))))) if len(np.unique(y_tr)) > 1 else 3
-            cv = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=42)
-            cv_scores = cross_val_score(cv_model, X_flat_train, y_tr, cv=cv, scoring="accuracy")
+            cv_scores = self._safe_cv_scores(cv_model, X_flat_train, y_tr)
 
             self.evaluation[t_name] = {
                 "test_accuracy": test_accs,
@@ -624,6 +624,32 @@ class TimeSeriesPredictor:
         self.last_train_size = len(df)
         self.save_state()
         return summary
+
+    @staticmethod
+    def _safe_cv_scores(model, x_train: np.ndarray, y_train: np.ndarray) -> np.ndarray:
+        unique_classes, class_counts = np.unique(y_train, return_counts=True)
+        if len(unique_classes) < 2 or len(y_train) < 2:
+            return np.array([float("nan")])
+
+        min_class_count = int(np.min(class_counts))
+        if min_class_count >= 2:
+            cv_splits = min(5, min_class_count)
+            cv_splits = max(2, cv_splits)
+            cv = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=42)
+        else:
+            n_splits = min(5, len(y_train))
+            if n_splits < 2:
+                return np.array([float("nan")])
+            cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+        try:
+            def safe_accuracy(y_true, y_pred):
+                return TimeSeriesPredictor._simple_accuracy(y_true, TimeSeriesPredictor._coerce_class_predictions(y_pred))
+
+            scorer = make_scorer(safe_accuracy)
+            return cross_val_score(model, x_train, y_train, cv=cv, scoring=scorer)
+        except Exception:
+            return np.array([float("nan")])
 
     def _extract_single_sample(self, df: pd.DataFrame, next_period: int) -> Tuple[np.ndarray, np.ndarray]:
         if len(df) < self.seq_len:
@@ -924,17 +950,6 @@ def show_prediction(pred: Dict[str, object]) -> None:
             top2 = pred["top2_predictions"][target]
             st.write(f"{target}: {top2[0]['label']} ({top2[0]['probability']:.4f}), {top2[1]['label']} ({top2[1]['probability']:.4f})")
 
-    st.markdown("### Synthesis Score Charts")
-    for target in ["number", "color", "big_small"]:
-        st.write(target)
-        chart_df = pd.DataFrame(
-            {
-                "label": list(pred["synthesis_scores"][target].keys()),
-                "score": list(pred["synthesis_scores"][target].values()),
-            }
-        ).set_index("label")
-        st.bar_chart(chart_df)
-
 
 def main() -> None:
     st.set_page_config(page_title="Time-Series Outcome Predictor", layout="wide")
@@ -948,6 +963,11 @@ def main() -> None:
             st.session_state["active_data_path"] = data_path
 
     predictor: TimeSeriesPredictor = st.session_state["predictor"]
+
+    if "prediction_by_period" not in st.session_state:
+        st.session_state["prediction_by_period"] = {}
+    if "actual_pred_table" not in st.session_state:
+        st.session_state["actual_pred_table"] = []
 
     for t in TARGETS:
         if t not in predictor.performance_stats:
@@ -984,6 +1004,12 @@ def main() -> None:
                     raise ValueError("Period must be a non-negative integer")
                 pred = predictor.predict_next(period_val)
                 st.session_state["last_prediction"] = pred
+                st.session_state["prediction_by_period"][str(period_val)] = {
+                    "Period": str(period_val),
+                    "Predicted Number": int(pred["number_prediction"]),
+                    "Predicted Color": str(pred["color_prediction"]),
+                    "Predicted Big/Small": str(pred["big_small_prediction"]),
+                }
                 show_prediction(pred)
             except Exception as e:
                 st.error(str(e))
@@ -1034,12 +1060,43 @@ def main() -> None:
                 "Big/Small": actual_bs,
                 "Color": actual_color,
             }
+
+            pred_row = st.session_state["prediction_by_period"].get(str(saved_period))
+            if pred_row:
+                row = {
+                    "Period": str(saved_period),
+                    "Actual Number": int(actual_number),
+                    "Predicted Number": int(pred_row["Predicted Number"]),
+                    "Number Match": bool(int(actual_number) == int(pred_row["Predicted Number"])),
+                    "Actual Color": str(actual_color),
+                    "Predicted Color": str(pred_row["Predicted Color"]),
+                    "Color Match": bool(str(actual_color).strip().lower() == str(pred_row["Predicted Color"]).strip().lower()),
+                    "Actual Big/Small": str(actual_bs),
+                    "Predicted Big/Small": str(pred_row["Predicted Big/Small"]),
+                    "Big/Small Match": bool(str(actual_bs).strip().lower() == str(pred_row["Predicted Big/Small"]).strip().lower()),
+                }
+                st.session_state["actual_pred_table"] = [
+                    row,
+                    *[
+                        r
+                        for r in st.session_state["actual_pred_table"]
+                        if str(r.get("Period", "")) != str(saved_period)
+                    ],
+                ]
+
             if retrained:
                 st.success("Actual result added. Batch threshold reached, model retrained.")
             else:
                 st.success(f"Actual result added. Pending updates for retrain: {pending}/{predictor.retrain_batch_size}")
         except Exception as e:
             st.error(str(e))
+
+    st.markdown("## Actual vs Predicted Table")
+    if st.session_state["actual_pred_table"]:
+        ap_df = pd.DataFrame(st.session_state["actual_pred_table"])
+        st.dataframe(ap_df, width="stretch")
+    else:
+        st.info("Pehle Predict karein, phir same Period ka Actual add karein. Table yahin show hogi.")
 
     st.markdown("## Recent Actual Results")
     try:
